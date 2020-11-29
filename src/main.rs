@@ -75,7 +75,10 @@ impl State {
             // TODO: does this need to be mut?
             let out_job: &mut Job = match self.jobs.get_mut(out_jobid) {
                 Some(x) => x,
-                None => return Err(StateError::InvalidJobID),
+                None => {
+                    eprintln!("Failed to find {} in the jobs map", out_jobid);
+                    return Err(StateError::InvalidJobID);
+                }
             };
             in_job.ancestors.insert(out_job.jobid);
             out_job.descendants.insert(in_job.jobid);
@@ -113,10 +116,7 @@ impl State {
         };
     }
 
-    pub fn add_job(
-        &mut self,
-        mut job: Job,
-    ) -> Result<(), StateError> {
+    pub fn add_job(&mut self, mut job: Job) -> Result<(), StateError> {
         /*! Add a new job into the dependency graph, considering all of its
          * dependencies.  For each dependency of the new job, InOut
          * dependencies are broken down into an `In` insertion followed by an
@@ -152,53 +152,144 @@ impl State {
         Ok(())
     }
 
+    fn remove_job_from_dependents(&mut self, jobid: i64) -> Result<HashSet<i64>, StateError> {
+        let job = match self.jobs.get_mut(&jobid) {
+            Some(x) => x,
+            None => return Err(StateError::InvalidJobID),
+        };
+
+        let mut error_occurred: bool = false;
+        let error = StateError::MissingDescendant;
+        let mut ret = HashSet::new();
+
+        for descendant_id in job.descendants.clone().iter() {
+            let descendant_job = match self.jobs.get_mut(descendant_id) {
+                Some(x) => x,
+                None => {
+                    eprintln!("Descendant Job ID ({}) not found", descendant_id);
+                    error_occurred = true;
+                    continue;
+                }
+            };
+            if !descendant_job.ancestors.remove(&jobid) {
+                eprintln!("WARN: Job ID not found in descendant's ancestor list");
+            }
+            if descendant_job.ancestors.len() == 0 {
+                ret.insert(descendant_job.jobid);
+            }
+        }
+
+        if error_occurred {
+            return Err(error);
+        }
+
+        Ok(ret)
+    }
+
+    fn remove_job_from_state_maps(&mut self, jobid: i64) -> Result<(), StateError> {
+        let job = match self.jobs.get_mut(&jobid) {
+            Some(x) => x,
+            None => return Err(StateError::InvalidJobID),
+        };
+
+        let out_dependencies: Vec<&Dependency> = job
+            .dependencies
+            .iter()
+            .filter(|x| {
+                (x.dep_type == DependencyType::Out) || (x.dep_type == DependencyType::InOut)
+            })
+            .collect();
+
+        // TODO: implement fluid support
+        // delete from matching 'out' labels in global/user scope
+        for dependency in out_dependencies
+            .iter()
+            .filter(|x| x.scope == DependencyScope::Global)
+        {
+            let relevant_map = self
+                .global_symbol_map
+                .get_mut(&dependency.value)
+                .expect("Dependency value missing in global map");
+            if relevant_map.remove(&jobid) == false {
+                eprintln!(
+                    "Failed to remove {}'s {} out dependency from the global scope",
+                    jobid, dependency.value
+                );
+            }
+            if relevant_map.len() == 0 {
+                self.global_symbol_map.remove(&dependency.value);
+            }
+        }
+
+        match self.user_symbol_map.get_mut(&job.user) {
+            Some(user_map) => {
+                for dependency in out_dependencies
+                    .iter()
+                    .filter(|x| x.scope == DependencyScope::User)
+                {
+                    let relevant_map = user_map
+                        .get_mut(&dependency.value)
+                        .expect("Dependency value missing in user map");
+                    if relevant_map .remove(&jobid)
+                        == false
+                    {
+                        eprintln!(
+                            "Failed to remove {}'s {} out dependency from user {}'s scope",
+                            jobid, dependency.value, job.user
+                        );
+                    }
+                    if relevant_map.len() == 0 {
+                        user_map.remove(&dependency.value);
+                    }
+                }
+                if user_map.len() == 0 {
+                    self.user_symbol_map.remove(&job.user);
+                }
+            }
+            None => {}
+        }
+
+        // match job.scope
+        self.jobs.remove(&jobid);
+
+        Ok(())
+    }
+
+    fn submit_event(&mut self, jobid: i64) -> Result<HashSet<i64>, StateError> {
+        let job = match self.jobs.get_mut(&jobid) {
+            Some(x) => x,
+            None => return Err(StateError::InvalidJobID),
+        };
+
+        let mut ret = HashSet::new();
+        if job.ancestors.len() == 0 {
+            ret.insert(job.jobid);
+        }
+        Ok(ret)
+    }
+
     pub fn job_event(&mut self, jobid: i64, event: String) -> Result<HashSet<i64>, StateError> {
         /*! Given a specific job and it's event, calculate the effects of this
          * event on other jobs.  Specifically, calculate which jobs are now
          * free to run. For example, if a job completes, determine which jobs
          * are now free to run given the completion of their dependency.
          */
-        let job = match self.jobs.get(&jobid) {
-            Some(x) => x,
-            None => return Err(StateError::InvalidJobID),
-        };
-        let mut ret = HashSet::new();
         match event.as_str() {
-            "submit" => {
-                if job.ancestors.len() == 0 {
-                    ret.insert(jobid);
-                }
-            }
-            "depend" => {}
-            "alloc" => {}
+            "submit" => self.submit_event(jobid),
+            "depend" => Ok(HashSet::new()),
+            "alloc" => Ok(HashSet::new()),
             "finish" | "cancel" => {
-                let mut error_occurred: bool = false;
-                let error = StateError::MissingDescendant;
-                for descendant_id in job.descendants.clone().iter() {
-                    let descendant_job = match self.jobs.get_mut(descendant_id) {
-                        Some(x) => x,
-                        None => {
-                            eprintln!("Descendant Job ID ({}) not found", descendant_id);
-                            error_occurred = true;
-                            continue;
-                        }
-                    };
-                    if !descendant_job.ancestors.remove(&jobid) {
-                        eprintln!("WARN: Job ID not found in descendant's ancestor list");
-                    }
-                    if descendant_job.ancestors.len() == 0 {
-                        ret.insert(descendant_job.jobid);
-                    }
-                }
-                // match job.scope
-                self.jobs.remove(&jobid);
-                if error_occurred {
-                    return Err(error);
-                }
+                let ret = self
+                    .remove_job_from_dependents(jobid)
+                    .map_err(|err| return err);
+                let _ret2 = self
+                    .remove_job_from_state_maps(jobid)
+                    .map_err(|err| return err);
+
+                ret
             }
             _ => return Err(StateError::InvalidEvent),
         }
-        Ok(ret)
     }
 }
 
@@ -288,8 +379,9 @@ mod tests {
             let mut state = State::new(1);
 
             state
-                .add_job(
-                    Job::new(1, 1,
+                .add_job(Job::new(
+                    1,
+                    1,
                     vec![Dependency::new(
                         DependencyType::Out,
                         scope.clone(),
@@ -299,8 +391,9 @@ mod tests {
                 ))
                 .expect("Add job failed");
             state
-                .add_job(
-                    Job::new(2, 1,
+                .add_job(Job::new(
+                    2,
+                    1,
                     vec![Dependency::new(
                         DependencyType::InOut,
                         scope.clone(),
@@ -310,8 +403,9 @@ mod tests {
                 ))
                 .expect("Add job failed");
             state
-                .add_job(
-                    Job::new(3, 1,
+                .add_job(Job::new(
+                    3,
+                    1,
                     vec![Dependency::new(
                         DependencyType::In,
                         scope.clone(),
@@ -348,8 +442,9 @@ mod tests {
     fn job_fan_out() {
         let mut state = State::new(1);
         state
-            .add_job(
-                Job::new(1, 1,
+            .add_job(Job::new(
+                1,
+                1,
                 vec![Dependency::new_global_string(
                     DependencyType::Out,
                     "foo".to_string(),
@@ -358,8 +453,9 @@ mod tests {
             .expect("Add job failed");
         for jobid in vec![2, 3, 4].iter() {
             state
-                .add_job(
-                    Job::new(*jobid, 1,
+                .add_job(Job::new(
+                    *jobid,
+                    1,
                     vec![
                         Dependency::new_global_string(DependencyType::In, "foo".to_string()),
                         Dependency::new_global_string(DependencyType::Out, "bar".to_string()),
@@ -368,8 +464,9 @@ mod tests {
                 .expect("Add job failed");
         }
         state
-            .add_job(
-                Job::new(5, 1,
+            .add_job(Job::new(
+                5,
+                1,
                 vec![Dependency::new_global_string(
                     DependencyType::In,
                     "bar".to_string(),
@@ -415,8 +512,9 @@ mod tests {
         //! currently queued/running job can be immediately scheduled.
         let mut state = State::new(1);
         state
-            .add_job(
-                Job::new(1, 1,
+            .add_job(Job::new(
+                1,
+                1,
                 vec![Dependency::new_global_string(
                     DependencyType::In,
                     "foo".to_string(),
@@ -433,8 +531,9 @@ mod tests {
         let out = state.job_event(1, "submit".to_string());
         assert_err_eq(out, StateError::InvalidJobID);
         state
-            .add_job(
-                Job::new(1, 1,
+            .add_job(Job::new(
+                1,
+                1,
                 vec![Dependency::new_global_string(
                     DependencyType::In,
                     "foo".to_string(),
@@ -458,8 +557,9 @@ mod tests {
     #[test]
     fn invalid_global_out_dep() {
         let mut state = State::new(1);
-        let out = state.add_job(
-            Job::new(1, 2,
+        let out = state.add_job(Job::new(
+            1,
+            2,
             vec![Dependency::new_global_string(
                 DependencyType::Out,
                 "foo".to_string(),
@@ -472,8 +572,9 @@ mod tests {
     fn test_user_global_separation() {
         let mut state = State::new(1);
         state
-            .add_job(
-                Job::new(1, 1,
+            .add_job(Job::new(
+                1,
+                1,
                 vec![Dependency::new(
                     DependencyType::Out,
                     DependencyScope::Global,
@@ -483,8 +584,9 @@ mod tests {
             ))
             .expect("Add job failed");
         state
-            .add_job(
-                Job::new(2, 2,
+            .add_job(Job::new(
+                2,
+                2,
                 vec![Dependency::new(
                     DependencyType::In,
                     DependencyScope::User,
@@ -505,8 +607,9 @@ mod tests {
     fn test_user_global_interleave() {
         let mut state = State::new(1);
         state
-            .add_job(
-                Job::new(1, 1,
+            .add_job(Job::new(
+                1,
+                1,
                 vec![Dependency::new(
                     DependencyType::Out,
                     DependencyScope::Global,
@@ -516,8 +619,9 @@ mod tests {
             ))
             .expect("Add job failed");
         state
-            .add_job(
-                Job::new(2, 2,
+            .add_job(Job::new(
+                2,
+                2,
                 vec![
                     Dependency::new(
                         DependencyType::In,
@@ -535,8 +639,9 @@ mod tests {
             ))
             .expect("Add job failed");
         state
-            .add_job(
-                Job::new(3, 2,
+            .add_job(Job::new(
+                3,
+                2,
                 vec![Dependency::new(
                     DependencyType::In,
                     DependencyScope::User,
@@ -562,8 +667,9 @@ mod tests {
     fn test_duplicate_id() {
         let mut state = State::new(1);
         state
-            .add_job(
-                Job::new(1, 1,
+            .add_job(Job::new(
+                1,
+                1,
                 vec![Dependency::new(
                     DependencyType::Out,
                     DependencyScope::Global,
@@ -573,8 +679,9 @@ mod tests {
             ))
             .expect("Add job failed");
         assert_err_eq(
-            state.add_job(
-                Job::new(1, 1,
+            state.add_job(Job::new(
+                1,
+                1,
                 vec![Dependency::new(
                     DependencyType::Out,
                     DependencyScope::Global,
@@ -585,8 +692,9 @@ mod tests {
             StateError::DuplicateJobID,
         );
         assert_err_eq(
-            state.add_job(
-                Job::new(1, 2,
+            state.add_job(Job::new(
+                1,
+                2,
                 vec![Dependency::new(
                     DependencyType::Out,
                     DependencyScope::Global,
@@ -600,10 +708,11 @@ mod tests {
 
     #[test]
     fn test_cleanup_after_cancel() {
-        let mut state = State::new(1);
+        let mut state = State::new(2);
         state
-            .add_job(
-                Job::new(1, 1,
+            .add_job(Job::new(
+                1,
+                2,
                 vec![Dependency::new(
                     DependencyType::Out,
                     DependencyScope::Global,
@@ -615,13 +724,17 @@ mod tests {
         assert_jobs_eq(state.job_event(1, "submit".to_string()), &vec![1]);
         assert_noop(state.job_event(1, "depend".to_string()));
         assert_noop(state.job_event(1, "cancel".to_string()));
-        assert_err_eq(state.job_event(1, "finish".to_string()), StateError::InvalidJobID);
+        assert_err_eq(
+            state.job_event(1, "finish".to_string()),
+            StateError::InvalidJobID,
+        );
         assert!(state.global_symbol_map.get("foo").is_none());
         assert!(state.jobs.get(&1).is_none());
 
         state
-            .add_job(
-                Job::new(1, 1,
+            .add_job(Job::new(
+                2,
+                1,
                 vec![Dependency::new(
                     DependencyType::Out,
                     DependencyScope::User,
@@ -631,18 +744,33 @@ mod tests {
             ))
             .expect("Add job failed");
         assert_jobs_eq(state.job_event(2, "submit".to_string()), &vec![2]);
+        assert!(
+            state
+                .user_symbol_map
+                .get(&1)
+                .expect("User not in user symbol map")
+                .get("foo")
+                .unwrap()
+                .len()
+                == 1
+        );
         assert_noop(state.job_event(2, "depend".to_string()));
         assert_noop(state.job_event(2, "cancel".to_string()));
-        assert!(state.user_symbol_map.get(&2).expect("User not in user symbol map").get("foo").is_none());
         assert!(state.jobs.get(&2).is_none());
+        assert!(state.user_symbol_map.get(&1).is_none());
+
+        assert!(state.jobs.len() == 0);
+        assert!(state.global_symbol_map.len() == 0);
+        assert!(state.user_symbol_map.len() == 0);
     }
 
     #[test]
     fn test_cancel_job() {
         let mut state = State::new(1);
         state
-            .add_job(
-                Job::new(1, 1,
+            .add_job(Job::new(
+                1,
+                1,
                 vec![Dependency::new(
                     DependencyType::Out,
                     DependencyScope::Global,
@@ -652,8 +780,9 @@ mod tests {
             ))
             .expect("Add job failed");
         state
-            .add_job(
-                Job::new(2, 1,
+            .add_job(Job::new(
+                2,
+                1,
                 vec![Dependency::new(
                     DependencyType::In,
                     DependencyScope::Global,
@@ -668,8 +797,9 @@ mod tests {
         assert_jobs_eq(state.job_event(1, "cancel".to_string()), &vec![2]);
         assert_noop(state.job_event(2, "depend".to_string()));
         state
-            .add_job(
-                Job::new(3, 1,
+            .add_job(Job::new(
+                3,
+                1,
                 vec![Dependency::new(
                     DependencyType::In,
                     DependencyScope::Global,
