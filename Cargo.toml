@@ -5,5 +5,5 @@ authors = ["Stephen Herbein <herbein1@llnl.gov>"]
 edition = "2018"
 
 [dependencies.flux-rs]
-git = "https://github.com/SteVwonder/flux-rs"
-branch = "add-integration-tests"
+git = "https://github.com/flux-framework/flux-rs"
+branch = "master"
